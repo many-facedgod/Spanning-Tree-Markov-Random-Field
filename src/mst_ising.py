@@ -8,7 +8,7 @@ import torch.nn as nn
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Generator, Iterable, Tuple
 
-from tqdm import tqdm, trange
+from tqdm import trange
 
 
 class GenerativeModel(nn.Module, ABC):
@@ -106,8 +106,8 @@ class MSTIsingModel(GenerativeModel):
 
         :param x: The batch (batch x *image_shape)
         :param n_samples: The number of weight samples to be averaged
-        :return: A pair of vectors each of size (n_samples, ) representing the data log-probability and the weights
-                 log-probability.
+        :return: A pair of tensors representing the data log-probability (batch_size, n_samples) and the weights
+                 log-probability (n_samples, ).
         """
         conditioned_logprobs = []
         tree_logprobs = []
@@ -121,13 +121,13 @@ class MSTIsingModel(GenerativeModel):
             numerator = self._calculate_log_num(x, tree)
             conditioned_logprobs.append(numerator - denominator)
             tree_logprobs.append(h_log_prob + v_log_prob)
-        return torch.stack(conditioned_logprobs), torch.stack(tree_logprobs)
+        return torch.stack(conditioned_logprobs).t(), torch.stack(tree_logprobs)
 
     def log_prob(self, x: torch.Tensor) -> torch.Tensor:
         """
         Given a batch of images, get the average log-probability using the learned tree.
         :param x: The batch of images.
-        :return: The average log-probability
+        :return: The average log-probability (batch_size, )
         """
         tree = self.tree
         denominator = self._log_denominator
@@ -152,19 +152,17 @@ class MSTIsingModel(GenerativeModel):
         point_iterator = self._get_order_gen()
         tree = self.tree
         log_denominator = self._log_denominator.item()
-        tqdm.write('Burning in')
-        bar = trange(burn_in, file=sys.stdout, desc=f'Current log-prob: NaN', leave=False)
+        bar = trange(burn_in, file=sys.stdout, desc=f'Burn-in log-prob: NaN', leave=False)
         curr_guess = (np.random.random(self.image_shape) < 0.5).astype(np.int64)
         for _ in bar:
             curr_guess, new_lp = self._gibbs_step(curr_guess, next(point_iterator), tree, log_denominator)
-            bar.set_description(f'Current log-prob: {new_lp}')
+            bar.set_description(f'Burn-in log-prob: {new_lp}')
         samples = []
-        tqdm.write('Running Gibbs chain')
-        bar = trange(n_iters, file=sys.stdout, desc=f'Current log-prob: NaN', leave=False)
+        bar = trange(n_iters, file=sys.stdout, desc=f'Gibbs-chain log-prob: NaN', leave=False)
         for _ in bar:
             new_guess, new_lp = self._gibbs_step(curr_guess, next(point_iterator), tree, log_denominator)
             samples.append(new_guess)
-            bar.set_description(f'Current log-prob: {new_lp}')
+            bar.set_description(f'Gibbs-chain log-prob: {new_lp}')
             curr_guess = new_guess
         return np.array(samples)
 
@@ -230,11 +228,11 @@ class MSTIsingModel(GenerativeModel):
     def _calculate_log_num(self, x: torch.Tensor, tree: Tuple[torch.Tensor, torch.Tensor]):
         """Get the numerator for the log-probability."""
         dtype = self.params['dtype']
-        point_wise = (x.type(dtype).mean(dim=0) * self.point_wise).sum()
-        horizontal = ((x[:, :, :-1] == x[:, :, 1:]).type(dtype).mean(dim=0) * tree[0].float() *
-                      self.horizontal_links).sum()
-        vertical = ((x[:, :-1, :] == x[:, 1:, :]).type(dtype).mean(dim=0) * tree[1].float() *
-                    self.vertical_links).sum()
+        point_wise = (x.type(dtype) * self.point_wise).sum(dim=(-1, -2))
+        horizontal = ((x[:, :, :-1] == x[:, :, 1:]).type(dtype) * tree[0].float() *
+                      self.horizontal_links).sum(dim=(-1, -2))
+        vertical = ((x[:, :-1, :] == x[:, 1:, :]).type(dtype) * tree[1].float() *
+                    self.vertical_links).sum(dim=(-1, -2))
         return point_wise + horizontal + vertical
 
     def _calculate_log_denom(self, tree: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -285,7 +283,7 @@ class MSTIsingModel(GenerativeModel):
         return torch.logsumexp(torch.stack(_func((0, 0))), dim=0)
 
 
-class Classifier(object):
+class Classifier(nn.Module):
     """A classifier that takes in a list of generative models, one for each class and uses them to predict classes."""
 
     def __init__(self, generative_models: Iterable[GenerativeModel]) -> None:
@@ -293,17 +291,16 @@ class Classifier(object):
         Initialize the classifier
         :param generative_models: A list of PyTorch generative models.
         """
-        self.generative_models = generative_models
+        super().__init__()
+        self.generative_models = nn.ModuleList(generative_models)
+        self.n_classes = len(self.generative_models)
 
-    @torch.no_grad()
-    def predict(self, x: torch.Tensor) -> Tuple[int, np.ndarray]:
+    def forward(self, x: torch.Tensor) -> torch.tensor:
         """
         Predict the class for the input x
         :param x: The input x
-        :return: The class index and the log-probabilities
+        :return: The class index and the log-probabilities (batch_size, n_classes)
         """
         log_probs = [model.log_prob(x) for model in self.generative_models]
         conditional_lps = torch.log_softmax(torch.stack(log_probs), dim=0)
-        ind = torch.argmax(conditional_lps)
-        return ind.item(), conditional_lps.detach().cpu().numpy()
-
+        return conditional_lps.t()
